@@ -1,0 +1,479 @@
+#!/bin/sh
+# razorbill-install - Razorbill Linux 0.1 installer
+# 7 stages: welcome -> disk -> network -> desktop -> packages -> user -> confirm
+# Installs to /mnt. Nothing is written to disk until the confirm stage.
+#
+# NOTE: busybox ash does not support `trap ... ERR`, so every risky command
+# is run through run(), which checks the exit code explicitly and shows a
+# real error dialog + points at the log instead of silently dying.
+
+DIALOGRC=/root/.dialogrc
+export DIALOGRC
+
+TMP=/tmp/razorbill-install
+LOG=/root/razorbill-install.log
+mkdir -p "$TMP"
+: > "$LOG"
+
+NET_OK=0
+DESKTOP=none
+PACKAGES=""
+DOAS_ONLY=0
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+setup_dialogrc() {
+    if [ ! -f "$DIALOGRC" ]; then
+        dialog --create-rc "$DIALOGRC"
+        # force pure monochrome: any color name becomes WHITE (fg) / BLACK (bg)
+        sed -i -E \
+            's/\((RED|GREEN|YELLOW|BLUE|MAGENTA|CYAN)/\(WHITE/g; s/,(RED|GREEN|YELLOW|BLUE|MAGENTA|CYAN)/,BLACK/g' \
+            "$DIALOGRC"
+    fi
+}
+
+msg() {
+    dialog --backtitle "razorbill installer" --infobox "$1" 5 55
+    sleep 1
+}
+
+die() {
+    dialog --backtitle "razorbill installer" --msgbox "ERROR: $1\n\nSee $LOG for details." 12 60
+    clear
+    exit 1
+}
+
+# run <description> <command...>
+# Runs a command, logs its output, and dies with a real dialog if it fails.
+# This replaces `set -e` + ERR trap, which does not work reliably in ash.
+run() {
+    desc="$1"
+    shift
+    echo "+++ $desc" >> "$LOG"
+    echo "+++ $*" >> "$LOG"
+    "$@" >> "$LOG" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        die "$desc failed (exit $rc)\ncommand: $*"
+    fi
+    return 0
+}
+
+# reread_partition_table <disk>
+# sgdisk writes the GPT but does not reliably make the kernel create the new
+# /dev/xxxN device nodes on its own (seen on virtio disks in QEMU). Force a
+# rescan through whatever tools are available.
+reread_partition_table() {
+    disk="$1"
+    echo "+++ Re-reading partition table on $disk" >> "$LOG"
+    partprobe "$disk"        >> "$LOG" 2>&1
+    blockdev --rereadpt "$disk" >> "$LOG" 2>&1
+    mdev -s                  >> "$LOG" 2>&1
+}
+
+# wait_for_partition <partition>
+# Polls for a device node to appear (up to ~6s) instead of guessing with a
+# blind sleep. Dies with a clear message if it never shows up.
+wait_for_partition() {
+    part="$1"
+    i=0
+    while [ ! -b "$part" ] && [ "$i" -lt 6 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    if [ ! -b "$part" ]; then
+        die "Partition $part never appeared after partitioning.\nCheck $LOG"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# stage 1: welcome
+# ---------------------------------------------------------------------------
+
+stage_welcome() {
+    dialog --backtitle "razorbill installer" \
+        --menu "the razorbill installer\n\na small but mighty distro built to be ready for anything" \
+        15 58 3 \
+        "start"  "Begin installation" \
+        "rescue" "Drop to a rescue shell" \
+        "exit"   "Exit installer" \
+        2>"$TMP/welcome"
+
+    case "$(cat "$TMP/welcome")" in
+        start)  ;;
+        rescue) clear; exec /bin/sh ;;
+        exit)   clear; exit 0 ;;
+        *)      clear; exit 0 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# stage 2: disk
+# ---------------------------------------------------------------------------
+
+stage_disk() {
+    disklist=$(lsblk -dno NAME,SIZE,MODEL | awk '{model=$3; for(i=4;i<=NF;i++) model=model" "$i; printf "/dev/%s \"%s %s\" ", $1, $2, model}')
+
+    eval dialog --backtitle \"razorbill installer\" \
+        --menu \"Which disk would you like to use?\" 15 60 6 $disklist \
+        2>"$TMP/disk"
+    DISK=$(cat "$TMP/disk")
+    [ -z "$DISK" ] && die "No disk selected"
+
+    dialog --backtitle "razorbill installer" \
+        --menu "How would you like to use $DISK?" 15 55 2 \
+        "full-wipe" "Erase and auto-partition" \
+        "manual"    "Use cfdisk" \
+        2>"$TMP/diskmode"
+    DISKMODE=$(cat "$TMP/diskmode")
+
+    case "$DISK" in
+        *nvme*|*mmcblk*) SEP="p" ;;
+        *) SEP="" ;;
+    esac
+
+    if [ "$DISKMODE" = "full-wipe" ]; then
+        dialog --backtitle "razorbill installer" \
+            --yesno "WARNING: $DISK will be completely erased. Continue?" 10 55
+        if [ $? -ne 0 ]; then
+            stage_disk
+            return
+        fi
+
+        msg "Erasing $DISK ..."
+        run "Erase disk" sgdisk --zap-all "$DISK"
+
+        msg "Creating partitions ..."
+        run "Create BIOS boot partition" sgdisk -n1:0:+1M   -t1:ef02 -c1:"BIOS boot" "$DISK"
+        run "Create EFI partition"       sgdisk -n2:0:+512M -t2:ef00 -c2:"EFI"       "$DISK"
+        run "Create swap partition"      sgdisk -n3:0:+2G   -t3:8200 -c3:"swap"      "$DISK"
+        run "Create root partition"      sgdisk -n4:0:0     -t4:8300 -c4:"root"      "$DISK"
+
+        BIOSBOOTPART="${DISK}${SEP}1"
+        BOOTPART="${DISK}${SEP}2"
+        SWAPPART="${DISK}${SEP}3"
+        ROOTPART="${DISK}${SEP}4"
+
+        msg "Waiting for kernel to register new partitions ..."
+        reread_partition_table "$DISK"
+        wait_for_partition "$BIOSBOOTPART"
+        wait_for_partition "$BOOTPART"
+        wait_for_partition "$SWAPPART"
+        wait_for_partition "$ROOTPART"
+
+        msg "Formatting partitions ..."
+        run "Format EFI partition"  mkfs.vfat -F32 "$BOOTPART"
+        run "Format swap partition" mkswap "$SWAPPART"
+        run "Format root partition" mkfs.ext4 -F "$ROOTPART"
+    else
+        clear
+        cfdisk "$DISK"
+        clear
+
+        partlist=$(lsblk -no NAME "$DISK" | tail -n +2 | awk '{print "/dev/"$1, "\"partition\""}')
+
+        eval dialog --backtitle \"razorbill installer\" \
+            --menu \"Which partition is /boot \(EFI\)?\" 15 55 6 $partlist \
+            2>"$TMP/bootpart"
+        BOOTPART=$(cat "$TMP/bootpart")
+
+        eval dialog --backtitle \"razorbill installer\" \
+            --menu \"Which partition is swap?\" 15 55 6 $partlist \
+            2>"$TMP/swappart"
+        SWAPPART=$(cat "$TMP/swappart")
+
+        eval dialog --backtitle \"razorbill installer\" \
+            --menu \"Which partition is / \(root\)?\" 15 55 6 $partlist \
+            2>"$TMP/rootpart"
+        ROOTPART=$(cat "$TMP/rootpart")
+
+        [ -z "$BOOTPART" ] || [ -z "$SWAPPART" ] || [ -z "$ROOTPART" ] && \
+            die "You must assign all three partition roles"
+
+        msg "Waiting for kernel to register new partitions ..."
+        reread_partition_table "$DISK"
+        wait_for_partition "$BOOTPART"
+        wait_for_partition "$SWAPPART"
+        wait_for_partition "$ROOTPART"
+
+        msg "Formatting partitions ..."
+        run "Format EFI partition"  mkfs.vfat -F32 "$BOOTPART"
+        run "Format swap partition" mkswap "$SWAPPART"
+        run "Format root partition" mkfs.ext4 -F "$ROOTPART"
+    fi
+
+    msg "Mounting filesystems ..."
+    run "Mount root" mount "$ROOTPART" /mnt
+    mkdir -p /mnt/boot
+    run "Mount boot" mount "$BOOTPART" /mnt/boot
+    swapon "$SWAPPART" >> "$LOG" 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# stage 3: network
+# ---------------------------------------------------------------------------
+
+stage_network() {
+    dialog --backtitle "razorbill installer" \
+        --menu "Network setup" 15 55 3 \
+        "ethernet" "Use a wired connection" \
+        "wifi"     "Connect to a wireless network" \
+        "skip"     "Continue offline (limits desktop/package choices)" \
+        2>"$TMP/netchoice"
+
+    case "$(cat "$TMP/netchoice")" in
+        ethernet)
+            IFACE=$(ip -o link show | awk -F': ' '/eth|enp|eno|ens/{print $2; exit}')
+            [ -z "$IFACE" ] && die "No wired interface found"
+
+            msg "Bringing up $IFACE ..."
+            ip link set "$IFACE" up >> "$LOG" 2>&1
+            udhcpc -i "$IFACE" >> "$LOG" 2>&1
+
+            if ping -c1 -W3 1.1.1.1 >> "$LOG" 2>&1; then
+                NET_OK=1
+            else
+                dialog --backtitle "razorbill installer" \
+                    --msgbox "Could not get an IP on $IFACE. Continuing offline." 10 55
+                NET_OK=0
+            fi
+            ;;
+        wifi)
+            dialog --backtitle "razorbill installer" --inputbox "SSID:" 10 50 2>"$TMP/ssid"
+            ssid=$(cat "$TMP/ssid")
+
+            dialog --backtitle "razorbill installer" --insecure \
+                --passwordbox "Password:" 10 50 2>"$TMP/pass"
+            pass=$(cat "$TMP/pass")
+
+            IFACE=$(ip -o link show | awk -F': ' '/wlan|wlp/{print $2; exit}')
+            [ -z "$IFACE" ] && die "No wireless interface found"
+
+            ip link set "$IFACE" up >> "$LOG" 2>&1
+            wpa_supplicant -B -i "$IFACE" -c <(wpa_passphrase "$ssid" "$pass") >> "$LOG" 2>&1
+            udhcpc -i "$IFACE" >> "$LOG" 2>&1
+
+            if ping -c1 -W3 1.1.1.1 >> "$LOG" 2>&1; then
+                NET_OK=1
+            else
+                dialog --backtitle "razorbill installer" \
+                    --msgbox "Could not connect. Continuing offline." 10 50
+                NET_OK=0
+            fi
+            ;;
+        skip)
+            NET_OK=0
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# stage 4: desktop
+# ---------------------------------------------------------------------------
+
+stage_desktop() {
+    if [ "$NET_OK" -eq 0 ]; then
+        DESKTOP=none
+        dialog --backtitle "razorbill installer" \
+            --msgbox "Offline install: desktop environment and extra packages are unavailable.\n\nContinuing with terminal only." 10 55
+        return
+    fi
+
+    dialog --backtitle "razorbill installer" \
+        --menu "Choose your fit" 15 55 5 \
+        "none"     "Terminal only" \
+        "dwl"      "Rice-ready, ultra-light" \
+        "xfce"     "Light + full-featured" \
+        "cinnamon" "Easy browsing" \
+        "kde"      "Full customization" \
+        2>"$TMP/dechoice"
+    DESKTOP=$(cat "$TMP/dechoice")
+}
+
+# ---------------------------------------------------------------------------
+# stage 5: packages
+# ---------------------------------------------------------------------------
+
+stage_packages() {
+    [ "$NET_OK" -eq 0 ] && return
+
+    dialog --backtitle "razorbill installer" \
+        --checklist "Select extra packages" 15 55 6 \
+        "vim"     "Text editor"      on \
+        "git"     "Version control"  on \
+        "firefox" "Web browser"      off \
+        "htop"    "Process viewer"   off \
+        "neovim"  "Modern vim"       off \
+        2>"$TMP/pkgchoice"
+    PACKAGES=$(tr -d '"' < "$TMP/pkgchoice")
+}
+
+# ---------------------------------------------------------------------------
+# stage 6: user
+# ---------------------------------------------------------------------------
+
+stage_user() {
+    dialog --backtitle "razorbill installer" \
+        --inputbox "Hostname:" 10 50 "razorbill" 2>"$TMP/hostname"
+    HOSTNAME=$(cat "$TMP/hostname")
+    [ -z "$HOSTNAME" ] && HOSTNAME="razorbill"
+
+    dialog --backtitle "razorbill installer" \
+        --inputbox "Username:" 10 50 2>"$TMP/username"
+    USERNAME=$(cat "$TMP/username")
+    [ -z "$USERNAME" ] && die "A username is required"
+
+    dialog --backtitle "razorbill installer" --insecure \
+        --passwordbox "Password for $USERNAME:" 10 50 2>"$TMP/userpass"
+    USERPASS=$(cat "$TMP/userpass")
+
+    dialog --backtitle "razorbill installer" --insecure \
+        --passwordbox "Root password:" 10 50 2>"$TMP/rootpass"
+    ROOTPASS=$(cat "$TMP/rootpass")
+
+    dialog --backtitle "razorbill installer" \
+        --yesno "Disable root login and use doas only?" 10 55
+    if [ $? -eq 0 ]; then
+        DOAS_ONLY=1
+    else
+        DOAS_ONLY=0
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# stage 7: confirm + actual install
+# ---------------------------------------------------------------------------
+
+stage_confirm() {
+    summary="Disk: $DISK ($DISKMODE)\nDesktop: $DESKTOP\nPackages: ${PACKAGES:-none}\nHostname: $HOSTNAME\nUsername: $USERNAME\nDoas-only: $([ "$DOAS_ONLY" -eq 1 ] && echo yes || echo no)\n\nNothing has been written to disk yet."
+
+    dialog --backtitle "razorbill installer" \
+        --yesno "$summary\n\nConfirm and install?" 20 60
+    if [ $? -ne 0 ]; then
+        clear
+        exit 0
+    fi
+
+    do_install
+}
+
+do_install() {
+    msg "Setting up repositories ..."
+    mkdir -p /mnt/etc/apk
+    if [ -f /etc/apk/repositories ]; then
+        cp /etc/apk/repositories /mnt/etc/apk/repositories
+    else
+        printf "http://dl-cdn.alpinelinux.org/alpine/v3.24/main\nhttp://dl-cdn.alpinelinux.org/alpine/v3.24/community\n" \
+            > /mnt/etc/apk/repositories
+    fi
+
+    mkdir -p /mnt/etc/apk/keys
+    cp /etc/apk/keys/* /mnt/etc/apk/keys/ 2>> "$LOG"
+
+    msg "Installing base system (this takes a while) ..."
+    run "Install base system" apk add --root /mnt --initdb --update-cache \
+        alpine-base linux-lts linux-firmware busybox openrc \
+        e2fsprogs dosfstools mkinitfs doas
+
+    for fs in proc sys dev; do
+        mount --bind /$fs /mnt/$fs
+    done
+
+    msg "Configuring system ..."
+    echo "$HOSTNAME" > /mnt/etc/hostname
+
+    {
+        echo "$(blkid -s UUID -o value "$ROOTPART") / ext4 rw,relatime 0 1"
+        echo "$(blkid -s UUID -o value "$BOOTPART") /boot vfat rw,relatime 0 2"
+        echo "$(blkid -s UUID -o value "$SWAPPART") none swap sw 0 0"
+    } > /mnt/etc/fstab
+
+    if [ "$DESKTOP" != "none" ]; then
+        msg "Installing desktop: $DESKTOP ..."
+        case "$DESKTOP" in
+            dwl)
+                run "Install dwl" apk add --root /mnt dwl sddm sddm-openrc dbus elogind
+                ;;
+            xfce)
+                run "Install xfce" apk add --root /mnt xfce4 xfce4-terminal sddm sddm-openrc dbus elogind
+                ;;
+            cinnamon)
+                run "Install cinnamon" apk add --root /mnt cinnamon sddm sddm-openrc dbus elogind
+                ;;
+            kde)
+                run "Install kde" apk add --root /mnt plasma-desktop plasma-workspace breeze breeze-icons \
+                    kde-cli-tools konsole dolphin sddm sddm-openrc dbus elogind
+                ;;
+        esac
+        run "Enable dbus"    chroot /mnt rc-update add dbus
+        run "Enable elogind" chroot /mnt rc-update add elogind
+        run "Enable sddm"    chroot /mnt rc-update add sddm
+    fi
+
+    if [ -n "$PACKAGES" ]; then
+        msg "Installing extra packages ..."
+        run "Install extra packages" apk add --root /mnt $PACKAGES
+    fi
+
+    msg "Creating user ..."
+    run "Create user" chroot /mnt adduser -D "$USERNAME"
+    echo "$USERNAME:$USERPASS" | chroot /mnt chpasswd >> "$LOG" 2>&1
+    echo "root:$ROOTPASS"      | chroot /mnt chpasswd >> "$LOG" 2>&1
+    run "Add user to wheel" chroot /mnt addgroup "$USERNAME" wheel
+
+    mkdir -p /mnt/etc/doas.d
+    echo "permit persist :wheel" > /mnt/etc/doas.d/doas.conf
+    if [ "$DOAS_ONLY" -eq 1 ]; then
+        chroot /mnt passwd -l root >> "$LOG" 2>&1
+    fi
+
+    msg "Enabling core services ..."
+    for svc_lvl in \
+        "devfs sysinit" "dmesg sysinit" "mdev sysinit" \
+        "hwdrivers sysinit" "modloop sysinit" \
+        "hwclock boot" "modules boot" "sysctl boot" \
+        "hostname boot" "bootmisc boot" "syslog boot" \
+        "networking default" "local default" \
+        "mount-ro shutdown" "killprocs shutdown" "savecache shutdown"
+    do
+        svc=$(echo "$svc_lvl" | cut -d' ' -f1)
+        lvl=$(echo "$svc_lvl" | cut -d' ' -f2)
+        chroot /mnt rc-update add "$svc" "$lvl" >> "$LOG" 2>&1
+    done
+
+    msg "Building initramfs ..."
+    kver=$(chroot /mnt ls /lib/modules)
+    run "Build initramfs" chroot /mnt mkinitfs "$kver"
+
+    msg "Installing GRUB bootloader ..."
+    run "Install grub packages" apk add --root /mnt grub grub-bios
+    run "Install grub to disk"  chroot /mnt grub-install --target=i386-pc "$DISK"
+    run "Generate grub config"  chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+
+    msg "Finishing up ..."
+    for fs in proc sys dev; do
+        umount /mnt/$fs 2>> "$LOG" || true
+    done
+    umount /mnt/boot 2>> "$LOG" || true
+    umount /mnt 2>> "$LOG" || true
+    swapoff "$SWAPPART" 2>> "$LOG" || true
+
+    dialog --backtitle "razorbill installer" \
+        --msgbox "Installation complete!\n\nYou can now reboot into Razorbill Linux." 10 50
+    clear
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+setup_dialogrc
+stage_welcome
+stage_disk
+stage_network
+stage_desktop
+stage_packages
+stage_user
+stage_confirm
